@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# Environment
+.env
+*.env.local
+
+# Logs
+logs/*.log
+
+# Raw / intermediate data (large files — not needed in repo)
+data/raw/
+data/cleaned/
+data/transformed/
+data/bronze/
+data/silver/
+
+# Gold data IS committed (small Parquet files powering the API)
+# data/gold/ — intentionally included
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Test cache
+.pytest_cache/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Docker volumes
+pg_data/
