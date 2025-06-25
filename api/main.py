@@ -1,21 +1,24 @@
 """
 FastAPI — Supply Chain Analytics API
-Serves pre-computed Gold layer Parquet tables as JSON endpoints.
+Reads pre-computed JSON files (converted from Gold Parquet at build time).
+No pandas or pyarrow required at runtime — works within Vercel's 250 MB limit.
 """
 
 import os
+import json
 import math
-from functools import lru_cache
+import io
 from pathlib import Path
+from datetime import datetime, timezone
 
-import pandas as pd
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Supply Chain Analytics API",
-    description="Medallion-architecture data served from Gold layer Parquet files.",
+    description="Medallion-architecture data served from pre-computed JSON files.",
     version="1.0.0",
 )
 
@@ -26,51 +29,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Data paths ────────────────────────────────────────────────────────────────
-GOLD_DIR = Path(__file__).resolve().parent.parent / "data" / "gold"
+# ── Data directory — works both locally and on Vercel ────────────────────────
+DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
-def _load(name: str) -> pd.DataFrame:
-    path = GOLD_DIR / f"{name}.parquet"
+def _load(name: str) -> list[dict]:
+    path = DATA_DIR / f"{name}.json"
     if not path.exists():
         raise HTTPException(status_code=503, detail=f"Data not ready: {name}")
-    df = pd.read_parquet(path)
-    # replace NaN / Inf so JSON serialisation doesn't break
-    return df.replace([float("inf"), float("-inf")], None).fillna(
-        {c: 0 for c in df.select_dtypes("number").columns}
-    )
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
-def _clean(df: pd.DataFrame) -> list[dict]:
-    """Convert DataFrame to JSON-safe list of dicts."""
-    records = df.to_dict(orient="records")
-    cleaned = []
-    for row in records:
-        cleaned.append(
-            {
-                k: (None if (isinstance(v, float) and math.isnan(v)) else v)
-                for k, v in row.items()
-            }
-        )
-    return cleaned
+def _safe(v):
+    """Make a value JSON-safe."""
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    return v
+
+
+def _clean(records: list[dict]) -> list[dict]:
+    return [{k: _safe(v) for k, v in row.items()} for row in records]
 
 
 # ── KPI summary ───────────────────────────────────────────────────────────────
 @app.get("/api/kpis")
 def get_kpis():
     rev  = _load("gold_monthly_revenue")
-    fact = _load("fact_sales")
     cust = _load("dim_customer")
     late = _load("gold_late_delivery_risk")
 
-    total_revenue   = round(float(rev["total_revenue"].sum()), 2)
-    total_orders    = int(rev["total_orders"].sum())
-    avg_order_value = round(total_revenue / total_orders if total_orders else 0, 2)
-    total_profit    = round(float(rev["total_profit"].sum()), 2)
-    total_customers = int(len(cust))
-    late_pct        = round(
-        float(late["late_shipments"].sum() / late["total_shipments"].sum() * 100), 1
-    )
+    total_revenue   = round(sum(r["total_revenue"]  for r in rev), 2)
+    total_orders    = sum(r["total_orders"]   for r in rev)
+    total_profit    = round(sum(r["total_profit"]    for r in rev), 2)
+    total_customers = len(cust)
+    total_late      = sum(r["late_shipments"]   for r in late)
+    total_ships     = sum(r["total_shipments"]  for r in late)
+    late_pct        = round(total_late / total_ships * 100, 1) if total_ships else 0
+    avg_order_value = round(total_revenue / total_orders, 2) if total_orders else 0
     profit_margin   = round(total_profit / total_revenue * 100, 1) if total_revenue else 0
 
     return {
@@ -87,64 +83,75 @@ def get_kpis():
 # ── Revenue trend ─────────────────────────────────────────────────────────────
 @app.get("/api/revenue/monthly")
 def get_monthly_revenue(year: int = Query(None)):
-    df = _load("gold_monthly_revenue").sort_values(["order_year", "order_month"])
+    data = _load("gold_monthly_revenue")
+    data.sort(key=lambda r: (r["order_year"], r["order_month"]))
     if year:
-        df = df[df["order_year"] == year]
-    return _clean(df)
+        data = [r for r in data if r["order_year"] == year]
+    return _clean(data)
 
 
 @app.get("/api/revenue/years")
 def get_years():
-    df = _load("gold_monthly_revenue")
-    return sorted(df["order_year"].dropna().unique().astype(int).tolist())
+    data = _load("gold_monthly_revenue")
+    return sorted({int(r["order_year"]) for r in data})
 
 
-# ── Market performance ────────────────────────────────────────────────────────
+# ── Market ────────────────────────────────────────────────────────────────────
 @app.get("/api/market")
 def get_market(limit: int = Query(20)):
-    df = _load("gold_market_performance").sort_values("total_revenue", ascending=False)
-    return _clean(df.head(limit))
+    data = sorted(_load("gold_market_performance"), key=lambda r: r["total_revenue"], reverse=True)
+    return _clean(data[:limit])
 
 
 @app.get("/api/market/by-region")
 def get_market_by_region():
-    df = _load("gold_market_performance")
-    grouped = (
-        df.groupby("market")
-        .agg(
-            total_revenue=("total_revenue", "sum"),
-            total_orders =("total_orders",  "sum"),
-            late_pct     =("late_pct",      "mean"),
-        )
-        .round(2)
-        .reset_index()
-        .sort_values("total_revenue", ascending=False)
-    )
-    return _clean(grouped)
+    data = _load("gold_market_performance")
+    agg: dict[str, dict] = {}
+    for r in data:
+        m = r["market"]
+        if m not in agg:
+            agg[m] = {"market": m, "total_revenue": 0, "total_orders": 0, "late_pct_sum": 0, "n": 0}
+        agg[m]["total_revenue"] += r["total_revenue"]
+        agg[m]["total_orders"]  += r["total_orders"]
+        agg[m]["late_pct_sum"]  += r["late_pct"]
+        agg[m]["n"] += 1
+    result = []
+    for v in agg.values():
+        result.append({
+            "market":        v["market"],
+            "total_revenue": round(v["total_revenue"], 2),
+            "total_orders":  v["total_orders"],
+            "late_pct":      round(v["late_pct_sum"] / v["n"], 2) if v["n"] else 0,
+        })
+    return _clean(sorted(result, key=lambda r: r["total_revenue"], reverse=True))
 
 
 # ── Products ──────────────────────────────────────────────────────────────────
 @app.get("/api/products/top")
 def get_top_products(limit: int = Query(10)):
-    df = _load("gold_product_performance").sort_values("total_revenue", ascending=False)
-    return _clean(df.head(limit))
+    data = sorted(_load("gold_product_performance"), key=lambda r: r["total_revenue"], reverse=True)
+    return _clean(data[:limit])
 
 
 @app.get("/api/products/categories")
 def get_categories():
-    df = _load("gold_product_performance")
-    grouped = (
-        df.groupby("category_name")
-        .agg(
-            total_revenue =("total_revenue",  "sum"),
-            units_sold    =("units_sold",      "sum"),
-            avg_margin_pct=("avg_margin_pct",  "mean"),
-        )
-        .round(2)
-        .reset_index()
-        .sort_values("total_revenue", ascending=False)
-    )
-    return _clean(grouped)
+    data = _load("gold_product_performance")
+    agg: dict[str, dict] = {}
+    for r in data:
+        c = r["category_name"]
+        if c not in agg:
+            agg[c] = {"category_name": c, "total_revenue": 0, "units_sold": 0, "margin_sum": 0, "n": 0}
+        agg[c]["total_revenue"] += r["total_revenue"]
+        agg[c]["units_sold"]    += r["units_sold"]
+        agg[c]["margin_sum"]    += r["avg_margin_pct"]
+        agg[c]["n"] += 1
+    result = [{
+        "category_name":  v["category_name"],
+        "total_revenue":  round(v["total_revenue"], 2),
+        "units_sold":     v["units_sold"],
+        "avg_margin_pct": round(v["margin_sum"] / v["n"], 2) if v["n"] else 0,
+    } for v in agg.values()]
+    return _clean(sorted(result, key=lambda r: r["total_revenue"], reverse=True))
 
 
 # ── Customers ─────────────────────────────────────────────────────────────────
@@ -155,20 +162,19 @@ def get_customer_segments():
 
 @app.get("/api/customers/top")
 def get_top_customers(limit: int = Query(10)):
-    df = _load("dim_customer").sort_values("customer_lifetime_value", ascending=False)
-    cols = [
-        "customer_id", "customer_fname", "customer_lname",
-        "customer_segment", "customer_country",
-        "customer_lifetime_value", "avg_order_value",
-        "order_count", "is_repeat_customer",
-    ]
-    return _clean(df[cols].head(limit))
+    data = _load("dim_customer")
+    data.sort(key=lambda r: r.get("customer_lifetime_value", 0), reverse=True)
+    cols = ["customer_id", "customer_fname", "customer_lname", "customer_segment",
+            "customer_country", "customer_lifetime_value", "avg_order_value",
+            "order_count", "is_repeat_customer"]
+    return _clean([{k: r.get(k) for k in cols} for r in data[:limit]])
 
 
-# ── Delivery / shipping ───────────────────────────────────────────────────────
+# ── Delivery ──────────────────────────────────────────────────────────────────
 @app.get("/api/delivery/risk")
 def get_delivery_risk():
-    return _clean(_load("gold_late_delivery_risk").sort_values("late_pct", ascending=False))
+    data = sorted(_load("gold_late_delivery_risk"), key=lambda r: r["late_pct"], reverse=True)
+    return _clean(data)
 
 
 @app.get("/api/delivery/shipping-efficiency")
@@ -177,9 +183,6 @@ def get_shipping_efficiency():
 
 
 # ── Export ────────────────────────────────────────────────────────────────────
-from fastapi.responses import StreamingResponse
-import io
-
 @app.get("/api/export/{table}")
 def export_csv(table: str):
     allowed = {
@@ -188,70 +191,79 @@ def export_csv(table: str):
     }
     if table not in allowed:
         raise HTTPException(status_code=400, detail="Unknown table")
-    df = _load(f"gold_{table}")
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    buf.seek(0)
+    records = _load(f"gold_{table}")
+    if not records:
+        raise HTTPException(status_code=404, detail="No data")
+    headers_row = ",".join(records[0].keys())
+    rows = [headers_row] + [",".join(str(v) for v in r.values()) for r in records]
+    content = "\n".join(rows)
     return StreamingResponse(
-        io.BytesIO(buf.getvalue().encode()),
+        io.BytesIO(content.encode()),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={table}.csv"},
     )
 
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
-import os as _os
-from datetime import datetime as _dt
-
 @app.get("/api/meta")
 def get_meta():
-    fact_path = GOLD_DIR / "fact_sales.parquet"
+    json_path = DATA_DIR / "gold_monthly_revenue.json"
     last_refresh = (
-        _dt.fromtimestamp(fact_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-        if fact_path.exists() else "unknown"
+        datetime.fromtimestamp(json_path.stat().st_mtime, tz=timezone.utc)
+        .strftime("%Y-%m-%d %H:%M UTC")
+        if json_path.exists() else "unknown"
     )
     return {
-        "last_refresh":    last_refresh,
-        "source":          "DataCo Supply Chain Dataset (Kaggle)",
-        "record_count":    178027,
-        "date_range":      "Jan 2015 – Sep 2017",
-        "classification":  "Internal Only",
-        "owner":           "Data Engineering Team",
-        "contact":         "data-team@company.com",
-        "pipeline":        "Python · Pandas · FastAPI · PostgreSQL · Airflow · Docker",
-        "architecture":    "Medallion (Bronze → Silver → Gold)",
+        "last_refresh":   last_refresh,
+        "source":         "DataCo Supply Chain Dataset (Kaggle)",
+        "record_count":   178027,
+        "date_range":     "Jan 2015 - Sep 2017",
+        "classification": "Internal Only",
+        "owner":          "Data Engineering Team",
+        "contact":        "arpit0112ak@gmail.com",
+        "pipeline":       "Python · Pandas · FastAPI · PostgreSQL · Airflow · Docker",
+        "architecture":   "Medallion (Bronze -> Silver -> Gold)",
+    }
+
+
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+@app.get("/api/benchmarks")
+def get_benchmarks():
+    return {
+        "target_late_pct":        30.0,
+        "target_profit_margin":   15.0,
+        "target_aov":             500.0,
+        "target_repeat_rate":     60.0,
     }
 
 
 # ── Anomalies ─────────────────────────────────────────────────────────────────
 @app.get("/api/anomalies")
 def get_anomalies():
-    """Return months where MoM revenue growth was an outlier (>2 std dev)."""
-    df = _load("gold_monthly_revenue").sort_values(["order_year", "order_month"])
-    df["period"] = df["order_month_name"] + " " + df["order_year"].astype(str)
-    mean = df["mom_revenue_growth_pct"].mean()
-    std  = df["mom_revenue_growth_pct"].std()
-    anomalies = df[
-        (df["mom_revenue_growth_pct"].notna()) &
-        ((df["mom_revenue_growth_pct"] - mean).abs() > 1.8 * std)
-    ][["period", "order_year", "order_month", "total_revenue", "mom_revenue_growth_pct"]]
-    return _clean(anomalies)
-
-
-# ── Benchmarks ────────────────────────────────────────────────────────────────
-@app.get("/api/benchmarks")
-def get_benchmarks():
-    """Static industry-style benchmarks for the supply chain domain."""
-    return {
-        "target_late_pct":        30.0,   # industry target: <30% late
-        "target_profit_margin":   15.0,   # target margin %
-        "target_aov":             500.0,  # target avg order value $
-        "target_repeat_rate":     60.0,   # target repeat customer %
-    }
+    data = [r for r in _load("gold_monthly_revenue") if r.get("mom_revenue_growth_pct") is not None]
+    values = [r["mom_revenue_growth_pct"] for r in data]
+    if not values:
+        return []
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    std = variance ** 0.5
+    threshold = 1.8 * std
+    anomalies = [
+        {
+            "period": f"{r['order_month_name']} {int(r['order_year'])}",
+            "order_year":   r["order_year"],
+            "order_month":  r["order_month"],
+            "total_revenue": r["total_revenue"],
+            "mom_revenue_growth_pct": r["mom_revenue_growth_pct"],
+        }
+        for r in data
+        if abs(r["mom_revenue_growth_pct"] - mean) > threshold
+    ]
+    return _clean(sorted(anomalies, key=lambda r: (r["order_year"], r["order_month"])))
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 def health():
-    tables = [p.stem for p in GOLD_DIR.glob("*.parquet")]
+    tables = [p.stem for p in DATA_DIR.glob("*.json")]
     return {"status": "ok", "tables_available": len(tables), "tables": tables}

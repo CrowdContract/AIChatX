@@ -28,6 +28,9 @@ data/silver/
 # Gold data IS committed (small Parquet files powering the API)
 # data/gold/ — intentionally included
 
+# api/data JSON files ARE committed (converted from Gold, power Vercel API)
+# api/data/ — intentionally included
+
 # Node
 frontend/node_modules/
 frontend/dist/
