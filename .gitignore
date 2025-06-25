@@ -32,6 +32,9 @@ data/silver/
 # api/data/ — intentionally included
 
 # Node
+node_modules/
+dist/
+.vite/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
