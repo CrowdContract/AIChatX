@@ -1,5 +1,6 @@
-# Python
-__pycache__/
+# Root requirements.txt — LOCAL DEV ONLY, not used by Vercel
+# Vercel uses api/requirements.txt (fastapi, uvicorn only)
+requirements.txt
 *.pyc
 *.pyo
 *.pyd
